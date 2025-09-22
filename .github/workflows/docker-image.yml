@@ -26,4 +26,4 @@ jobs:
           file: .infra/docker/Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/janus-gateway-gateway:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/janus-rtp-gateway:latest
