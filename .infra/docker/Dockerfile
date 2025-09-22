@@ -15,4 +15,4 @@ WORKDIR /app
 COPY --from=builder /app/proxy /app/proxy
 RUN chmod +x /app/proxy
 
-ENTRYPOINT [".//app/proxy"]
+ENTRYPOINT ["/app/proxy"]
