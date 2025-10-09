@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -40,10 +42,21 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 		return stream, nil
 	}
 
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
-	conn, err := net.DialUDP("udp", nil, addr)
+	targetHost := os.Getenv("UDP_TARGET_HOST")
+	if targetHost == "" {
+		targetHost = "127.0.0.1"
+	}
+
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(int(port)))
+
+	udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
-		return nil, fmt.Errorf("не удалось открыть UDP-сокет на порт %d: %w", port, err)
+		return nil, fmt.Errorf("не удалось разрешить адрес %s: %w", targetAddr, err)
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось открыть UDP-сокет к %s: %w", targetAddr, err)
 	}
 
 	stream := &Stream{
@@ -52,7 +65,7 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 	}
 
 	streams[port] = stream
-	log.Printf("[Порт %d] Новый поток", port)
+	log.Printf("[Порт %d] Новый поток к %s", port, targetAddr)
 
 	go autoCleanup(port)
 
