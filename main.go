@@ -14,7 +14,7 @@ import (
 
 const (
 	LISTEN_PORT = 4000
-	BASE_PORT   = 10000
+	BASE_PORT   = 3000
 	TIMEOUT     = 30 * time.Second
 )
 
@@ -40,7 +40,7 @@ func getSSRC(packet []byte) (uint32, bool) {
 }
 
 func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
-	listenPort := BASE_PORT + ssrcPort
+	listenPort := ssrcPort - BASE_PORT
 	filename := fmt.Sprintf("video_%d_%s.mp4", ssrcPort, time.Now().Format("20060102_150405"))
 
 	// FFmpeg слушает listenPort, перенаправляет на ssrcPort и записывает в файл
@@ -224,11 +224,11 @@ func main() {
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
 
-		// Отправляем копию трафика на порт для записи ffmpeg (BASE_PORT + SSRC)
+		// Отправляем копию трафика на порт для записи ffmpeg (SSRC - BASE_PORT )
 		if enableRecording && stream.ffmpeg != nil {
 			localConn, err := net.DialUDP("udp", nil, &net.UDPAddr{
 				IP:   net.IPv4(127, 0, 0, 1),
-				Port: int(BASE_PORT + port),
+				Port: int(port - BASE_PORT),
 			})
 			if err == nil {
 				localConn.Write(buffer[:n])
