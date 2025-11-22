@@ -43,14 +43,12 @@ func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
 	listenPort := ssrcPort - BASE_PORT
 	filename := fmt.Sprintf("video_%d_%s.mp4", ssrcPort, time.Now().Format("20060102_150405"))
 
-	// FFmpeg слушает listenPort, перенаправляет на ssrcPort и записывает в файл
+	// FFmpeg ТОЛЬКО слушает и записывает, НЕ пересылает
 	cmd := exec.Command("ffmpeg",
 		"-f", "rtp", // входной формат RTP
 		"-i", fmt.Sprintf("rtp://127.0.0.1:%d", listenPort), // слушаем порт BASE_PORT + SSRC
 		"-c", "copy", // без перекодирования
-		"-f", "rtp", // выходной формат RTP
-		fmt.Sprintf("rtp://127.0.0.1:%d", ssrcPort), // пересылаем на оригинальный порт
-		"-c", "copy", // запись в файл тоже без перекодирования
+		"-f", "mp4", // выходной формат MP4
 		"-y", // перезаписывать файл
 		filename,
 	)
@@ -65,7 +63,7 @@ func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
 	// Даем ffmpeg время начать слушать порт
 	time.Sleep(500 * time.Millisecond)
 
-	log.Printf("🎥 FFmpeg слушает порт %d, пересылает на %d, запись в %s", listenPort, ssrcPort, filename)
+	log.Printf("🎥 FFmpeg слушает порт %d, запись в %s", listenPort, filename)
 	return cmd, nil
 }
 
