@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,13 +18,15 @@ const (
 
 type Stream struct {
 	conn     *net.UDPConn
+	file     *os.File
 	lastSeen time.Time
 	mutex    sync.RWMutex
 }
 
 var (
-	streams   = make(map[uint16]*Stream)
-	streamsMu sync.RWMutex
+	streams         = make(map[uint16]*Stream)
+	streamsMu       sync.RWMutex
+	enableRecording bool
 )
 
 func getSSRC(packet []byte) (uint32, bool) {
@@ -32,6 +35,20 @@ func getSSRC(packet []byte) (uint32, bool) {
 	}
 	ssrc := uint32(packet[8])<<24 | uint32(packet[9])<<16 | uint32(packet[10])<<8 | uint32(packet[11])
 	return ssrc, true
+}
+
+func createSDPFile(port uint16, filename string) error {
+	sdpContent := fmt.Sprintf(`v=0
+o=- %d 1 IN IP4 0.0.0.0
+s=Stream from port %d
+c=IN IP4 0.0.0.0
+t=0 0
+m=audio %d RTP/AVP 96
+a=rtpmap:96 OPUS/48000/2
+`, time.Now().Unix(), port, port)
+
+	sdpFilename := filename + ".sdp"
+	return os.WriteFile(sdpFilename, []byte(sdpContent), 0644)
 }
 
 func getOrCreateStream(port uint16) (*Stream, error) {
@@ -59,13 +76,39 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 		return nil, fmt.Errorf("не удалось открыть UDP-сокет к %s: %w", targetAddr, err)
 	}
 
+	var file *os.File
+	var filename string
+
+	if enableRecording {
+		// Создаем файл для записи RTP
+		filename = fmt.Sprintf("stream_%d_%s", port, time.Now().Format("20060102_150405"))
+		file, err = os.Create(filename + ".rtp")
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("не удалось создать файл %s: %w", filename, err)
+		}
+
+		// Создаем SDP файл
+		if err := createSDPFile(port, filename); err != nil {
+			log.Printf("⚠️ Не удалось создать SDP файл для порта %d: %v", port, err)
+		} else {
+			log.Printf("📄 Создан SDP файл: %s.sdp", filename)
+		}
+	}
+
 	stream := &Stream{
 		conn:     conn,
+		file:     file,
 		lastSeen: time.Now(),
 	}
 
 	streams[port] = stream
-	log.Printf("[Порт %d] Новый поток к %s", port, targetAddr)
+
+	if enableRecording {
+		log.Printf("[Порт %d] Новый поток к %s, запись в %s.rtp", port, targetAddr, filename)
+	} else {
+		log.Printf("[Порт %d] Новый поток к %s", port, targetAddr)
+	}
 
 	go autoCleanup(port)
 
@@ -95,6 +138,10 @@ func autoCleanup(port uint16) {
 			streamsMu.Lock()
 			if s, exists := streams[port]; exists {
 				s.conn.Close()
+				if s.file != nil {
+					s.file.Close()
+					log.Printf("💾 [Порт %d] Файл закрыт", port)
+				}
 				delete(streams, port)
 				log.Printf("🗑️ [Порт %d] Удалён", port)
 			}
@@ -106,6 +153,10 @@ func autoCleanup(port uint16) {
 }
 
 func main() {
+	// Проверяем переменную окружения для записи в файл
+	recordEnv := strings.ToLower(os.Getenv("RECORD_STREAMS"))
+	enableRecording = recordEnv == "true" || recordEnv == "1" || recordEnv == "yes"
+
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", LISTEN_PORT))
 	if err != nil {
 		log.Fatal("ResolveUDPAddr: ", err)
@@ -117,7 +168,11 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Printf("🚀 Слушаем RTP на :%d. SSRC = порт назначения. Таймаут: %v", LISTEN_PORT, TIMEOUT)
+	if enableRecording {
+		log.Printf("🚀 Слушаем RTP на :%d. Запись ВКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
+	} else {
+		log.Printf("🚀 Слушаем RTP на :%d. Запись ОТКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
+	}
 
 	buffer := make([]byte, 1500)
 
@@ -135,8 +190,6 @@ func main() {
 
 		port := uint16(ssrc)
 
-		// → Убрали проверку MIN/MAX — доверяем API
-		// Единственное — проверим, что порт не 0 (некорректный SSRC)
 		if port == 0 {
 			log.Printf("Пропускаем SSRC=0 (некорректный RTP)")
 			continue
@@ -150,9 +203,18 @@ func main() {
 
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
+
+		// Записываем в файл если включено
+		if enableRecording && stream.file != nil {
+			if _, err := stream.file.Write(buffer[:n]); err != nil {
+				log.Printf("Ошибка записи в файл для порта %d: %v", port, err)
+			}
+		}
+
+		// Отправляем по назначению
+		_, err = stream.conn.Write(buffer[:n])
 		stream.mutex.Unlock()
 
-		_, err = stream.conn.Write(buffer[:n])
 		if err != nil {
 			log.Printf("Ошибка отправки на порт %d: %v", port, err)
 		}
