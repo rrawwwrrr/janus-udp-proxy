@@ -43,27 +43,53 @@ func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
 	listenPort := ssrcPort - BASE_PORT
 	filename := fmt.Sprintf("video_%d_%s.mp4", ssrcPort, time.Now().Format("20060102_150405"))
 
-	// Пробуем разные подходы без SDP
+	// Создаем временный SDP файл
+	sdpContent := fmt.Sprintf(`v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=H.264 Video Stream
+c=IN IP4 127.0.0.1
+t=0 0
+m=video %d RTP/AVP 96
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1
+`, listenPort)
+
+	sdpFilename := fmt.Sprintf("temp_%d.sdp", ssrcPort)
+	if err := os.WriteFile(sdpFilename, []byte(sdpContent), 0644); err != nil {
+		return nil, fmt.Errorf("не удалось создать SDP файл: %w", err)
+	}
+
+	// FFmpeg использует SDP файл для записи
 	cmd := exec.Command("ffmpeg",
-		"-f", "rtp", // входной формат RTP
-		"-i", fmt.Sprintf("rtp://127.0.0.1:%d?timeout=5000000", listenPort), // с таймаутом
+		"-protocol_whitelist", "file,udp,rtp",
+		"-i", sdpFilename, // используем SDP файл
 		"-c", "copy", // без перекодирования
 		"-f", "mp4", // выходной формат MP4
 		"-y", // перезаписывать файл
 		filename,
 	)
 
-	// Направляем stderr в лог для отладки
+	// Направляем stderr и stdout в лог для отладки
 	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
 
 	if err := cmd.Start(); err != nil {
+		os.Remove(sdpFilename) // очищаем временный файл
 		return nil, fmt.Errorf("не удалось запустить ffmpeg: %w", err)
 	}
 
 	// Даем ffmpeg время начать слушать порт
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
-	log.Printf("🎥 FFmpeg слушает порт %d, запись в %s", listenPort, filename)
+	// Запускаем горутину для очистки временного SDP файла после завершения ffmpeg
+	go func(sdpFile string, process *exec.Cmd) {
+		process.Wait()
+		if err := os.Remove(sdpFile); err == nil {
+			log.Printf("🧹 Временный SDP файл %s удален", sdpFile)
+		}
+	}(sdpFilename, cmd)
+
+	log.Printf("🎥 FFmpeg слушает порт %d (через SDP), запись в %s", listenPort, filename)
 	return cmd, nil
 }
 
@@ -187,7 +213,7 @@ func main() {
 	defer conn.Close()
 
 	if enableRecording {
-		log.Printf("🚀 Слушаем RTP на :%d. FFmpeg записывает видео (порт = BASE_PORT + SSRC). Таймаут: %v", LISTEN_PORT, TIMEOUT)
+		log.Printf("🚀 Слушаем RTP на :%d. FFmpeg записывает видео через временные SDP файлы. Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	} else {
 		log.Printf("🚀 Слушаем RTP на :%d. Запись ОТКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	}
@@ -222,8 +248,8 @@ func main() {
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
 
-		// Отправляем копию трафика на порт для записи ffmpeg (SSRC - BASE_PORT )
-		if enableRecording && stream.ffmpeg != nil {
+		// Отправляем копию трафика на порт для записи ffmpeg (BASE_PORT + SSRC)
+		if enableRecording {
 			localConn, err := net.DialUDP("udp", nil, &net.UDPAddr{
 				IP:   net.IPv4(127, 0, 0, 1),
 				Port: int(port - BASE_PORT),
