@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ const (
 type Stream struct {
 	conn     *net.UDPConn
 	file     *os.File
+	ffmpeg   *exec.Cmd
 	lastSeen time.Time
 	mutex    sync.RWMutex
 }
@@ -37,18 +39,34 @@ func getSSRC(packet []byte) (uint32, bool) {
 	return ssrc, true
 }
 
-func createSDPFile(port uint16, filename string) error {
-	sdpContent := fmt.Sprintf(`v=0
-o=- %d 1 IN IP4 0.0.0.0
-s=Stream from port %d
-c=IN IP4 0.0.0.0
-t=0 0
-m=audio %d RTP/AVP 96
-a=rtpmap:96 OPUS/48000/2
-`, time.Now().Unix(), port, port)
+func startFFmpegRecording(port uint16) (*exec.Cmd, error) {
+	filename := fmt.Sprintf("video_%d_%s.mp4", port, time.Now().Format("20060102_150405"))
 
-	sdpFilename := filename + ".sdp"
-	return os.WriteFile(sdpFilename, []byte(sdpContent), 0644)
+	cmd := exec.Command("ffmpeg",
+		"-f", "rtp", // входной формат RTP
+		"-i", "pipe:0", // читать из stdin
+		"-c", "copy", // без перекодирования
+		"-y", // перезаписывать файл если существует
+		filename,
+	)
+
+	// Направляем stderr в лог для отладки
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("не удалось создать stdin pipe: %w", err)
+	}
+
+	// Сохраняем stdin для записи
+	cmd.ExtraFiles = []*os.File{stdin.(*os.File)}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("не удалось запустить ffmpeg: %w", err)
+	}
+
+	log.Printf("🎥 Начата запись видео порта %d в %s", port, filename)
+	return cmd, nil
 }
 
 func getOrCreateStream(port uint16) (*Stream, error) {
@@ -76,36 +94,25 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 		return nil, fmt.Errorf("не удалось открыть UDP-сокет к %s: %w", targetAddr, err)
 	}
 
-	var file *os.File
-	var filename string
-
+	var ffmpeg *exec.Cmd
 	if enableRecording {
-		// Создаем файл для записи RTP
-		filename = fmt.Sprintf("stream_%d_%s", port, time.Now().Format("20060102_150405"))
-		file, err = os.Create(filename + ".rtp")
+		ffmpeg, err = startFFmpegRecording(port)
 		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("не удалось создать файл %s: %w", filename, err)
-		}
-
-		// Создаем SDP файл
-		if err := createSDPFile(port, filename); err != nil {
-			log.Printf("⚠️ Не удалось создать SDP файл для порта %d: %v", port, err)
-		} else {
-			log.Printf("📄 Создан SDP файл: %s.sdp", filename)
+			log.Printf("⚠️ Не удалось запустить запись для порта %d: %v", port, err)
+			// Продолжаем работу без записи
 		}
 	}
 
 	stream := &Stream{
 		conn:     conn,
-		file:     file,
+		ffmpeg:   ffmpeg,
 		lastSeen: time.Now(),
 	}
 
 	streams[port] = stream
 
-	if enableRecording {
-		log.Printf("[Порт %d] Новый поток к %s, запись в %s.rtp", port, targetAddr, filename)
+	if enableRecording && ffmpeg != nil {
+		log.Printf("[Порт %d] Новый поток к %s, запись видео включена", port, targetAddr)
 	} else {
 		log.Printf("[Порт %d] Новый поток к %s", port, targetAddr)
 	}
@@ -138,9 +145,11 @@ func autoCleanup(port uint16) {
 			streamsMu.Lock()
 			if s, exists := streams[port]; exists {
 				s.conn.Close()
-				if s.file != nil {
-					s.file.Close()
-					log.Printf("💾 [Порт %d] Файл закрыт", port)
+				if s.ffmpeg != nil && s.ffmpeg.Process != nil {
+					s.ffmpeg.Process.Signal(os.Interrupt)
+					time.Sleep(100 * time.Millisecond)
+					s.ffmpeg.Process.Kill()
+					log.Printf("🎥 [Порт %d] Запись видео остановлена", port)
 				}
 				delete(streams, port)
 				log.Printf("🗑️ [Порт %d] Удалён", port)
@@ -157,6 +166,14 @@ func main() {
 	recordEnv := strings.ToLower(os.Getenv("RECORD_STREAMS"))
 	enableRecording = recordEnv == "true" || recordEnv == "1" || recordEnv == "yes"
 
+	// Проверяем что ffmpeg установлен
+	if enableRecording {
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			log.Printf("⚠️ FFmpeg не найден, запись видео отключена")
+			enableRecording = false
+		}
+	}
+
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", LISTEN_PORT))
 	if err != nil {
 		log.Fatal("ResolveUDPAddr: ", err)
@@ -169,7 +186,7 @@ func main() {
 	defer conn.Close()
 
 	if enableRecording {
-		log.Printf("🚀 Слушаем RTP на :%d. Запись ВКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
+		log.Printf("🚀 Слушаем RTP на :%d. Запись видео ВКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	} else {
 		log.Printf("🚀 Слушаем RTP на :%d. Запись ОТКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	}
@@ -204,10 +221,11 @@ func main() {
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
 
-		// Записываем в файл если включено
-		if enableRecording && stream.file != nil {
-			if _, err := stream.file.Write(buffer[:n]); err != nil {
-				log.Printf("Ошибка записи в файл для порта %d: %v", port, err)
+		// Записываем в ffmpeg если включено
+		if enableRecording && stream.ffmpeg != nil && stream.ffmpeg.Process != nil {
+			// Получаем stdin pipe ffmpeg
+			if stdin, err := stream.ffmpeg.StdinPipe(); err == nil {
+				stdin.Write(buffer[:n])
 			}
 		}
 
