@@ -14,12 +14,12 @@ import (
 
 const (
 	LISTEN_PORT = 4000
+	BASE_PORT   = 10000
 	TIMEOUT     = 30 * time.Second
 )
 
 type Stream struct {
 	conn     *net.UDPConn
-	file     *os.File
 	ffmpeg   *exec.Cmd
 	lastSeen time.Time
 	mutex    sync.RWMutex
@@ -39,33 +39,33 @@ func getSSRC(packet []byte) (uint32, bool) {
 	return ssrc, true
 }
 
-func startFFmpegRecording(port uint16) (*exec.Cmd, error) {
-	filename := fmt.Sprintf("video_%d_%s.mp4", port, time.Now().Format("20060102_150405"))
+func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
+	listenPort := BASE_PORT + ssrcPort
+	filename := fmt.Sprintf("video_%d_%s.mp4", ssrcPort, time.Now().Format("20060102_150405"))
 
+	// FFmpeg слушает listenPort, перенаправляет на ssrcPort и записывает в файл
 	cmd := exec.Command("ffmpeg",
 		"-f", "rtp", // входной формат RTP
-		"-i", "pipe:0", // читать из stdin
+		"-i", fmt.Sprintf("rtp://127.0.0.1:%d", listenPort), // слушаем порт BASE_PORT + SSRC
 		"-c", "copy", // без перекодирования
-		"-y", // перезаписывать файл если существует
+		"-f", "rtp", // выходной формат RTP
+		fmt.Sprintf("rtp://127.0.0.1:%d", ssrcPort), // пересылаем на оригинальный порт
+		"-c", "copy", // запись в файл тоже без перекодирования
+		"-y", // перезаписывать файл
 		filename,
 	)
 
 	// Направляем stderr в лог для отладки
 	cmd.Stderr = os.Stderr
 
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("не удалось создать stdin pipe: %w", err)
-	}
-
-	// Сохраняем stdin для записи
-	cmd.ExtraFiles = []*os.File{stdin.(*os.File)}
-
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("не удалось запустить ffmpeg: %w", err)
 	}
 
-	log.Printf("🎥 Начата запись видео порта %d в %s", port, filename)
+	// Даем ffmpeg время начать слушать порт
+	time.Sleep(500 * time.Millisecond)
+
+	log.Printf("🎥 FFmpeg слушает порт %d, пересылает на %d, запись в %s", listenPort, ssrcPort, filename)
 	return cmd, nil
 }
 
@@ -95,6 +95,7 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 	}
 
 	var ffmpeg *exec.Cmd
+
 	if enableRecording {
 		ffmpeg, err = startFFmpegRecording(port)
 		if err != nil {
@@ -112,7 +113,7 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 	streams[port] = stream
 
 	if enableRecording && ffmpeg != nil {
-		log.Printf("[Порт %d] Новый поток к %s, запись видео включена", port, targetAddr)
+		log.Printf("[Порт %d] Новый поток к %s, FFmpeg записывает", port, targetAddr)
 	} else {
 		log.Printf("[Порт %d] Новый поток к %s", port, targetAddr)
 	}
@@ -171,6 +172,8 @@ func main() {
 		if _, err := exec.LookPath("ffmpeg"); err != nil {
 			log.Printf("⚠️ FFmpeg не найден, запись видео отключена")
 			enableRecording = false
+		} else {
+			log.Printf("✅ FFmpeg найден, запись видео доступна")
 		}
 	}
 
@@ -186,7 +189,7 @@ func main() {
 	defer conn.Close()
 
 	if enableRecording {
-		log.Printf("🚀 Слушаем RTP на :%d. Запись видео ВКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
+		log.Printf("🚀 Слушаем RTP на :%d. FFmpeg записывает видео (порт = BASE_PORT + SSRC). Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	} else {
 		log.Printf("🚀 Слушаем RTP на :%d. Запись ОТКЛЮЧЕНА. Таймаут: %v", LISTEN_PORT, TIMEOUT)
 	}
@@ -221,15 +224,19 @@ func main() {
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
 
-		// Записываем в ffmpeg если включено
-		if enableRecording && stream.ffmpeg != nil && stream.ffmpeg.Process != nil {
-			// Получаем stdin pipe ffmpeg
-			if stdin, err := stream.ffmpeg.StdinPipe(); err == nil {
-				stdin.Write(buffer[:n])
+		// Отправляем копию трафика на порт для записи ffmpeg (BASE_PORT + SSRC)
+		if enableRecording && stream.ffmpeg != nil {
+			localConn, err := net.DialUDP("udp", nil, &net.UDPAddr{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Port: int(BASE_PORT + port),
+			})
+			if err == nil {
+				localConn.Write(buffer[:n])
+				localConn.Close()
 			}
 		}
 
-		// Отправляем по назначению
+		// Отправляем по назначению (оригинальный адрес)
 		_, err = stream.conn.Write(buffer[:n])
 		stream.mutex.Unlock()
 
