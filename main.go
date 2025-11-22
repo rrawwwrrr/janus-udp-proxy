@@ -43,10 +43,10 @@ func startFFmpegRecording(ssrcPort uint16) (*exec.Cmd, error) {
 	listenPort := ssrcPort - BASE_PORT
 	filename := fmt.Sprintf("video_%d_%s.mp4", ssrcPort, time.Now().Format("20060102_150405"))
 
-	// FFmpeg ТОЛЬКО слушает и записывает, НЕ пересылает
+	// Пробуем разные подходы без SDP
 	cmd := exec.Command("ffmpeg",
 		"-f", "rtp", // входной формат RTP
-		"-i", fmt.Sprintf("rtp://127.0.0.1:%d", listenPort), // слушаем порт BASE_PORT + SSRC
+		"-i", fmt.Sprintf("rtp://127.0.0.1:%d?timeout=5000000", listenPort), // с таймаутом
 		"-c", "copy", // без перекодирования
 		"-f", "mp4", // выходной формат MP4
 		"-y", // перезаписывать файл

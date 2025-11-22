@@ -8,7 +8,7 @@ RUN go build -o proxy
 
 FROM ubuntu:24.04
 
-RUN apt update && apt -y install ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt -y install --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/proxy /app/proxy
