@@ -280,26 +280,25 @@ func main() {
 		stream.lastSeen = time.Now()
 
 		// === ЛОГИРОВАНИЕ ТИПА КАДРА (один раз в N секунд) ===
-		if enableRecording {
-			shouldLog := false
-			now := time.Now()
+		shouldLog := false
+		now := time.Now()
 
-			if lastLogI, loaded := loggedPorts.Load(port); loaded {
-				if now.Sub(lastLogI.(time.Time)) >= MIN_LOG_INTERVAL {
-					shouldLog = true
-					loggedPorts.Store(port, now)
-				}
-			} else {
+		if lastLogI, loaded := loggedPorts.Load(port); loaded {
+			if now.Sub(lastLogI.(time.Time)) >= MIN_LOG_INTERVAL {
 				shouldLog = true
 				loggedPorts.Store(port, now)
 			}
-
-			if shouldLog && n > 12 {
-				payload := buffer[12:n]
-				nalTypeDesc := analyzeNALType(payload)
-				log.Printf("[Порт %d] 📊 Анализ: %s (первые байты: % X)", port, nalTypeDesc, payload[:min(8, len(payload))])
-			}
+		} else {
+			shouldLog = true
+			loggedPorts.Store(port, now)
 		}
+
+		if shouldLog && n > 12 {
+			payload := buffer[12:n]
+			nalTypeDesc := analyzeNALType(payload)
+			log.Printf("[Порт %d] 📊 Анализ: %s (первые байты: % X)", port, nalTypeDesc, payload[:min(8, len(payload))])
+		}
+
 		// ===================================================
 
 		// Отправляем копию на localhost для ffmpeg
