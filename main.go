@@ -13,24 +13,26 @@ import (
 )
 
 const (
-	LISTEN_PORT      = 4000
-	BASE_PORT        = 3000
-	TIMEOUT          = 30 * time.Second
-	MIN_LOG_INTERVAL = 5 * time.Second
+	LISTEN_PORT = 4000
+	BASE_PORT   = 3000
+	TIMEOUT     = 30 * time.Second
 )
 
 type Stream struct {
-	conn     *net.UDPConn
-	ffmpeg   *exec.Cmd
-	lastSeen time.Time
-	mutex    sync.RWMutex
+	conn            *net.UDPConn
+	ffmpeg          *exec.Cmd
+	lastSeen        time.Time
+	lastSeqNum      uint16
+	lastTimestamp   uint32
+	lastReceiveTime time.Time
+	initialized     bool
+	mutex           sync.RWMutex
 }
 
 var (
 	streams         = make(map[uint16]*Stream)
 	streamsMu       sync.RWMutex
 	enableRecording bool
-	loggedPorts     sync.Map // port uint16 -> last log time (time.Time)
 )
 
 // Извлечение SSRC из RTP заголовка
@@ -40,6 +42,33 @@ func getSSRC(packet []byte) (uint32, bool) {
 	}
 	ssrc := uint32(packet[8])<<24 | uint32(packet[9])<<16 | uint32(packet[10])<<8 | uint32(packet[11])
 	return ssrc, true
+}
+
+// Извлечение RTP sequence number и timestamp
+func getRTPInfo(packet []byte) (seqNum uint16, timestamp uint32, err error) {
+	if len(packet) < 12 {
+		return 0, 0, fmt.Errorf("пакет слишком короткий (%d байт)", len(packet))
+	}
+	seqNum = uint16(packet[2])<<8 | uint16(packet[3])
+	timestamp = uint32(packet[4])<<24 | uint32(packet[5])<<16 | uint32(packet[6])<<8 | uint32(packet[7])
+	return seqNum, timestamp, nil
+}
+
+// Расчёт потерянных пакетов с учётом переполнения 16-битного sequence number
+func calculateLostPackets(lastSeq, currentSeq uint16) uint16 {
+	if currentSeq == lastSeq {
+		return 0 // дубликат
+	}
+
+	diff := int(currentSeq) - int(lastSeq)
+	if diff < 0 {
+		diff += 0x10000 // 65536
+	}
+
+	if diff == 0 {
+		return 0 // дубликат (после коррекции)
+	}
+	return uint16(diff - 1)
 }
 
 // Анализ типа NAL-юнита в H.264
@@ -95,19 +124,16 @@ a=fmtp:96 packetization-mode=1
 		filename,
 	)
 
-	// Направляем stderr и stdout в лог для отладки
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
 	if err := cmd.Start(); err != nil {
-		os.Remove(sdpFilename) // очищаем временный файл
+		os.Remove(sdpFilename)
 		return nil, fmt.Errorf("не удалось запустить ffmpeg: %w", err)
 	}
 
-	// Даем ffmpeg время начать слушать порт
 	time.Sleep(1 * time.Second)
 
-	// Запускаем горутину для очистки временного SDP файла после завершения ffmpeg
 	go func(sdpFile string, process *exec.Cmd) {
 		process.Wait()
 		if err := os.Remove(sdpFile); err == nil {
@@ -149,14 +175,17 @@ func getOrCreateStream(port uint16) (*Stream, error) {
 		ffmpeg, err = startFFmpegRecording(port)
 		if err != nil {
 			log.Printf("⚠️ Не удалось запустить запись для порта %d: %v", port, err)
-			// Продолжаем работу без записи
 		}
 	}
 
 	stream := &Stream{
-		conn:     conn,
-		ffmpeg:   ffmpeg,
-		lastSeen: time.Now(),
+		conn:            conn,
+		ffmpeg:          ffmpeg,
+		lastSeen:        time.Now(),
+		lastSeqNum:      0,
+		lastTimestamp:   0,
+		lastReceiveTime: time.Now(),
+		initialized:     false,
 	}
 
 	streams[port] = stream
@@ -211,19 +240,12 @@ func autoCleanup(port uint16) {
 	}
 }
 
-// Вспомогательная функция min
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// Основная функция
 func main() {
+	// Проверяем переменную окружения для записи в файл
 	recordEnv := strings.ToLower(os.Getenv("RECORD_STREAMS"))
 	enableRecording = recordEnv == "true" || recordEnv == "1" || recordEnv == "yes"
 
+	// Проверяем что ffmpeg установлен
 	if enableRecording {
 		if _, err := exec.LookPath("ffmpeg"); err != nil {
 			log.Printf("⚠️ FFmpeg не найден, запись видео отключена")
@@ -278,30 +300,67 @@ func main() {
 
 		stream.mutex.Lock()
 		stream.lastSeen = time.Now()
+		receiveTime := time.Now() // Фиксируем время получения пакета
 
-		// === ЛОГИРОВАНИЕ ТИПА КАДРА (один раз в N секунд) ===
-		shouldLog := false
-		now := time.Now()
-
-		if lastLogI, loaded := loggedPorts.Load(port); loaded {
-			if now.Sub(lastLogI.(time.Time)) >= MIN_LOG_INTERVAL {
-				shouldLog = true
-				loggedPorts.Store(port, now)
+		// === 🔥 ДЕТАЛЬНЫЙ АНАЛИЗ ПАКЕТА ===
+		if n > 12 {
+			// 1. Извлекаем RTP информацию
+			seqNum, timestamp, rtpErr := getRTPInfo(buffer[:n])
+			if rtpErr != nil {
+				log.Printf(rtpErr.Error())
 			}
-		} else {
-			shouldLog = true
-			loggedPorts.Store(port, now)
-		}
-
-		if shouldLog && n > 12 {
+			nalTypeDesc := "неизвестно"
 			payload := buffer[12:n]
-			nalTypeDesc := analyzeNALType(payload)
-			log.Printf("[Порт %d] 📊 Анализ: %s (первые байты: % X)", port, nalTypeDesc, payload[:min(8, len(payload))])
+
+			// 2. Анализируем тип кадра
+			if len(payload) > 0 {
+				nalTypeDesc = analyzeNALType(payload)
+			}
+
+			// 3. Логируем I-кадры мгновенно
+			if nalTypeDesc == "I-кадр (IDR)" {
+				log.Printf("🔥 [Порт %d] I-КАДР (IDR) seq=%d, ts=%d, размер=%d байт, время=%s",
+					port, seqNum, timestamp, n, receiveTime.Format("15:04:05.000"))
+			}
+
+			// 4. Проверка потерь
+			lostPackets := uint16(0)
+			if stream.initialized {
+				lostPackets = calculateLostPackets(stream.lastSeqNum, seqNum)
+				if lostPackets > 0 {
+					log.Printf("⚠️ [Порт %d] ПОТЕРЯНО %d ПАКЕТОВ! [последний seq=%d → текущий seq=%d]",
+						port, lostPackets, stream.lastSeqNum, seqNum)
+				}
+			} else {
+				stream.initialized = true
+				log.Printf("🟢 [Порт %d] СТАРТ ПОТОКА seq=%d, ts=%d, тип=%s",
+					port, seqNum, timestamp, nalTypeDesc)
+			}
+
+			// 5. Анализ задержки (ИСПРАВЛЕНО!)
+			if stream.initialized {
+				receiveTimeMS := uint64(receiveTime.UnixNano() / 1e6)
+
+				if stream.lastTimestamp > 0 {
+					// Вычисляем ожидаемый интервал между пакетами (в миллисекундах)
+					expectedInterval := (timestamp - stream.lastTimestamp) / 90
+					actualInterval := receiveTimeMS - uint64(stream.lastReceiveTime.UnixNano()/1e6)
+
+					if actualInterval > uint64(expectedInterval)+50 {
+						log.Printf("⏱️ [Порт %d] ЗАДЕРЖКА! Ожидаемый интервал: %dms, Фактический: %dms (seq=%d)",
+							port, expectedInterval, actualInterval, seqNum)
+					}
+				}
+				stream.lastReceiveTime = receiveTime
+			}
+
+			// 6. Обновляем состояние потока
+			stream.lastSeqNum = seqNum
+			stream.lastTimestamp = timestamp
 		}
+		// ================================
 
-		// ===================================================
-
-		// Отправляем копию на localhost для ffmpeg
+		// Отправляем копию трафика на порт для записи ffmpeg (BASE_PORT + SSRC)
 		if enableRecording {
 			localConn, err := net.DialUDP("udp", nil, &net.UDPAddr{
 				IP:   net.IPv4(127, 0, 0, 1),
@@ -313,7 +372,7 @@ func main() {
 			}
 		}
 
-		// Пересылаем оригиналу
+		// Отправляем по назначению (оригинальный адрес)
 		_, err = stream.conn.Write(buffer[:n])
 		stream.mutex.Unlock()
 
